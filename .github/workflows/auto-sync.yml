@@ -50,7 +50,7 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit and push (with rebase-retry on conflict)
+      - name: Commit and push (with fetch-rebase-retry on conflict)
         if: steps.git_diff.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
@@ -80,7 +80,8 @@ jobs:
           NOTES="$NOTES
 
 Files changed: ${{ steps.sync.outputs.changed_count }}
-Commit: ${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD)"
+Commit: ${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD)
+Integrity manifest: MANIFEST.sha256.txt (SHA-256 per file, committed alongside)"
           if [ -f "$SUMMARY_FILE" ]; then
             NOTES="$NOTES
 
