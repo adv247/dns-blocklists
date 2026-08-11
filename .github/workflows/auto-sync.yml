@@ -22,6 +22,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      - name: Verify token has write access (fail fast with a clear message)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }} --jq '.permissions.push' 2>/dev/null || echo "unknown")
+          echo "GITHUB_TOKEN push permission on this repo: $PERM"
+          if [ "$PERM" != "true" ]; then
+            echo "::error::GITHUB_TOKEN cannot push to this repo. Go to Settings -> Actions -> General -> Workflow permissions and select 'Read and write permissions', then re-run. If this repo was forked, also open the Actions tab once and click 'I understand my workflows, go ahead and enable them'."
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -80,6 +91,7 @@ jobs:
           NOTES="$NOTES
 
 Files changed: ${{ steps.sync.outputs.changed_count }}
+Breakdown: ${{ steps.sync.outputs.breakdown }}
 Commit: ${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD)
 Integrity manifest: MANIFEST.sha256.txt (SHA-256 per file, committed alongside)"
           if [ -f "$SUMMARY_FILE" ]; then
@@ -100,7 +112,7 @@ $(cat "$SUMMARY_FILE")"
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ "${{ steps.git_diff.outputs.changed }}" = "true" ]; then
-            STATUS="Updated ${{ steps.sync.outputs.changed_count }} file(s), released as ${{ steps.version.outputs.tag }}."
+            STATUS="Updated ${{ steps.sync.outputs.changed_count }} file(s) -> ${{ steps.sync.outputs.breakdown }}. Released as ${{ steps.version.outputs.tag }}."
           else
             STATUS="No changes upstream, nothing to update."
           fi

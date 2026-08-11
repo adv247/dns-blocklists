@@ -8,6 +8,8 @@ Auto-sync HaGeZi DNS blocklists from GitLab mirror into this repo.
 - Records a SHA-256 hash for every synced file in .sync_state.json AND in
   MANIFEST.sha256.txt at repo root, so every update leaves a verifiable
   integrity record.
+- Tracks a per-category changed-file count (adblock, domains, hosts, ...)
+  so the Telegram notification can report exactly what changed and where.
 Run by .github/workflows/auto-sync.yml on a daily schedule.
 """
 import hashlib
@@ -176,16 +178,24 @@ def main():
     state = load_state()
     new_state = dict(state)
     changed_files = []
+    per_category = {}
     total_checked = 0
     for fmt in FORMAT_DIRS:
         try:
             checked, changed, entries = sync_format_dir(fmt, new_state, changed_files)
             total_checked += checked
             new_state.update(entries)
+            if changed:
+                per_category[fmt] = changed
         except Exception as e:
             print(f"[error] syncing {fmt}: {e}", file=sys.stderr)
 
+    desc_before = len(changed_files)
     fix_description_files(changed_files)
+    desc_changed = len(changed_files) - desc_before
+    if desc_changed:
+        per_category["description_files"] = desc_changed
+
     save_state(new_state)
     write_manifest(new_state)
 
@@ -198,11 +208,15 @@ def main():
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write(summary if summary else "(no changes)")
 
+    breakdown_lines = [f"{cat}: {n}" for cat, n in sorted(per_category.items(), key=lambda kv: -kv[1])]
+    breakdown = ", ".join(breakdown_lines) if breakdown_lines else "no changes"
+
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
         with open(gh_output, "a", encoding="utf-8") as f:
             f.write(f"changed_count={len(changed_files)}\n")
             f.write(f"summary_path={summary_path}\n")
+            f.write(f"breakdown={breakdown}\n")
 
 
 if __name__ == "__main__":
