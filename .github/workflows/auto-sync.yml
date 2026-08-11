@@ -22,17 +22,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Verify token has write access (fail fast with a clear message)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PERM=$(gh api repos/${{ github.repository }} --jq '.permissions.push' 2>/dev/null || echo "unknown")
-          echo "GITHUB_TOKEN push permission on this repo: $PERM"
-          if [ "$PERM" != "true" ]; then
-            echo "::error::GITHUB_TOKEN cannot push to this repo. Go to Settings -> Actions -> General -> Workflow permissions and select 'Read and write permissions', then re-run. If this repo was forked, also open the Actions tab once and click 'I understand my workflows, go ahead and enable them'."
-            exit 1
-          fi
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -62,31 +51,46 @@ jobs:
           fi
 
       - name: Commit and push (with fetch-rebase-retry on conflict)
+        id: push
         if: steps.git_diff.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "chore(sync): update blocklists ${{ steps.version.outputs.tag }} (${{ steps.sync.outputs.changed_count }} files)"
           for i in 1 2 3 4 5; do
-            if git push origin HEAD:main; then
+            if git push origin HEAD:main 2> push_error.log; then
+              echo "pushed=true" >> "$GITHUB_OUTPUT"
               exit 0
+            fi
+            cat push_error.log
+            if grep -qi "permission\|403\|denied" push_error.log; then
+              echo "::error::git push was denied (permission error). Go to Settings -> Actions -> General -> Workflow permissions and select 'Read and write permissions', then re-run this workflow."
+              exit 1
             fi
             echo "Push rejected (attempt $i), fetching + rebasing onto latest main..."
             git fetch origin main
             if ! git rebase origin/main; then
               git rebase --abort
-              echo "Rebase failed, giving up."
+              echo "::error::Rebase failed after push conflict, giving up."
               exit 1
             fi
             sleep $((i * 5))
           done
+          echo "::error::Push failed after 5 retries."
+          exit 1
 
       - name: Create GitHub Release
-        if: steps.git_diff.outputs.changed == 'true'
+        if: steps.git_diff.outputs.changed == 'true' && steps.push.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SUMMARY_FILE="${{ steps.sync.outputs.summary_path }}"
+          BASE_TAG="${{ steps.version.outputs.tag }}"
+          TAG="$BASE_TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            TAG="${BASE_TAG}-$(date -u +%S)"
+            echo "Tag $BASE_TAG already exists, using $TAG instead."
+          fi
           NOTES="Auto-synced from hagezi/mirror (GitLab) on $(date -u +'%Y-%m-%d %H:%M UTC')."
           NOTES="$NOTES
 
@@ -100,10 +104,10 @@ Integrity manifest: MANIFEST.sha256.txt (SHA-256 per file, committed alongside)"
 Changed files:
 $(cat "$SUMMARY_FILE")"
           fi
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --title "Blocklists sync ${{ steps.version.outputs.tag }}" \
+          gh release create "$TAG" \
+            --title "Blocklists sync $TAG" \
             --notes "$NOTES" \
-            --target main
+            --target main || echo "::warning::Release creation failed, but the sync commit was already pushed successfully."
 
       - name: Notify Telegram on success
         if: success()
@@ -127,7 +131,7 @@ $(cat "$SUMMARY_FILE")"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          MESSAGE="dns-blocklists auto-sync FAILED on $(date -u +'%Y-%m-%d %H:%M UTC'). Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="dns-blocklists auto-sync FAILED on $(date -u +'%Y-%m-%d %H:%M UTC'). Check: Settings -> Actions -> General -> Workflow permissions = Read and write. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"

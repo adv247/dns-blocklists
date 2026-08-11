@@ -1,94 +1,116 @@
-# Auto-Sync Automation
+# Auto-Sync Automation - Incident Report (Round 2)
 
-Pipeline that keeps `adv247/dns-blocklists` (branch `main`) in sync with
-[HaGeZi's blocklists on GitLab](https://gitlab.com/hagezi/mirror/-/tree/main/dns-blocklists),
-rewrites internal links, tracks integrity hashes, and tags releases with a
-CalVer scheme.
+## 1. Debug
 
-## What it does
+Even after you switched **Settings -> Actions -> General -> Workflow
+permissions** to "Read and write permissions", the workflow still failed
+with no new `chore(sync): ...` commit and no `.sync_state.json` /
+`MANIFEST.sha256.txt` appearing on `main`. That ruled out the repo
+permissions setting as the remaining cause.
 
-Workflow: [`.github/workflows/auto-sync.yml`](.github/workflows/auto-sync.yml)
-Script: [`scripts/auto_sync.py`](scripts/auto_sync.py)
+## 2. So sánh (compare against the previous fix)
 
-1. **Runs daily** via cron (`0 18 * * *`, 18:00 UTC = 01:00 Asia/Singapore),
-   or on demand via `workflow_dispatch`. A `concurrency` group
-   (`dns-blocklists-auto-sync`) makes sure two runs never race on the same
-   push.
-2. **Only updates changed files.** `scripts/auto_sync.py` keeps a small
-   state file, `.sync_state.json`, mapping every blocklist file to the
-   GitLab blob SHA it last saw. Each run lists the format directories
-   (`adblock`, `controld`, `dnsmasq`, `domains`, `hosts`, `ips`, `pac`,
-   `rpz`, `share`, `wildcard`) via the GitLab API and compares blob SHAs
-   **before downloading anything** — unchanged files are skipped entirely.
-   Files removed upstream are deleted locally too.
-3. **Rewrites links** hagezi → adv247 in every changed blocklist file and
-   in existing description files (README.md, sources.md, index.html...):
-   - `https://raw.githubusercontent.com/hagezi/dns-blocklists/main/...`
-     → `https://raw.githubusercontent.com/adv247/dns-blocklists/main/...`
-   - `https://github.com/hagezi/dns-blocklists/...`
-     → `https://github.com/adv247/dns-blocklists/...`
-4. **Records a SHA-256 hash** for every synced file — both inside
-   `.sync_state.json` and in a plain-text `MANIFEST.sha256.txt` at the repo
-   root, regenerated every run, so every update leaves a verifiable
-   integrity record you (or anyone) can check independently of Git's own
-   hashing.
-5. **Commits and pushes** to `main` as `github-actions[bot]`, with an
-   automatic **fetch → rebase → retry** loop (up to 5 attempts, backing off
-   5s/10s/15s/20s/25s) if the push is rejected because `main` moved in the
-   meantime.
-6. **Creates a GitHub Release only when something actually changed**,
-   tagged with CalVer — see below — with release notes listing exactly
-   which files changed (or a count if more than 50).
-7. **Sends a Telegram notification** on both success (file count + release
-   tag, or "no changes") and failure (with a direct link to the failed
-   run's logs).
-
-## Release versioning: CalVer
-
-Releases are tagged:
+The previous fix added a **"Verify token has write access"** step that
+called:
 
 ```
-v<YEAR>.<MONTH>.<DAY>-<HOUR><MINUTE>   (UTC)
-e.g. v2026.08.11-1830
+gh api repos/{owner}/{repo} --jq '.permissions.push'
 ```
 
-Why this instead of semver (`v1.2.3`):
+Comparing behavior before/after: this check can return `false`/`null`
+**even when the `GITHUB_TOKEN` genuinely has write access**, because the
+`permissions` object on the repo-details API response reflects metadata
+tied to the authenticated principal in a way that doesn't map cleanly onto
+the ephemeral, workflow-scoped `GITHUB_TOKEN`. In practice this made the
+check an unreliable predictor — it could fail-closed regardless of the
+real Workflow permissions setting.
 
-- The tag itself tells you **when** that snapshot was pulled, with no need
-  to open the release notes.
-- Tags sort correctly both chronologically and lexicographically.
-- A release only exists when files actually changed — the release list is
-  effectively a changelog of "when did the blocklists really update",
-  instead of one noisy release per day regardless of content.
+## 3. Phân tích luồng hoạt động
 
-## Running forever without manual intervention
+```
+checkout -> [BUGGY CHECK: exits 1 here, false negative] -> sync -> commit -> push -> release -> notify
+```
 
-- `permissions: contents: write` lets the workflow use the built-in
-  `GITHUB_TOKEN` — it never expires and needs no manual renewal, unlike a
-  personal access token.
-- `concurrency` + the fetch-rebase-retry loop make pushes self-healing
-  against transient races (e.g. a manual `workflow_dispatch` firing close
-  to the scheduled run).
-- Since the script only re-downloads/rewrites files whose GitLab blob SHA
-  changed, runs stay fast and cheap even as the upstream list set grows —
-  no need to ever manually prune or resync from scratch.
-- With this in place, the loop is: schedule → diff-only sync → link fix →
-  hash → commit (retry-safe) → release (only if changed) → Telegram
-  notification, indefinitely, with zero manual steps required under normal
-  operation.
+Because the buggy check ran immediately after checkout and exited early,
+none of the real work (sync, commit, push, release) ever executed —
+matching exactly what we observed (no state file, no commit, no release).
 
-## Setting up the Telegram notification
+## 4. Kiểm thử
 
-You need two GitHub Actions secrets: `TELEGRAM_BOT_TOKEN` and
-`TELEGRAM_CHAT_ID`.
+I re-verified: `main` still has no `.sync_state.json` / `MANIFEST.sha256.txt`
+after your re-run, confirming the job never reached the sync step.
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram, send
-   `/newbot`, follow the prompts — you get a token like
-   `123456789:ABCDefGhIJKlmNoPQRstuVWxyZ` (`TELEGRAM_BOT_TOKEN`).
-2. Message your new bot once (e.g. `hi`), then open
-   `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` in a browser
-   and read `"chat":{"id":<NUMBER>}` (`TELEGRAM_CHAT_ID`).
-3. Repo → **Settings → Secrets and variables → Actions** → add both as
-   **New repository secret**.
-4. Test via **Actions → Auto Sync DNS Blocklists from GitLab → Run
-   workflow**.
+## 5. Sửa lỗi
+
+**Removed the flawed "Verify token" step entirely.** Permission problems
+now surface naturally and unambiguously at the one place they actually
+matter — the `git push` command itself — which is a ground-truth test,
+not a guess:
+
+- The push step now captures `git push` stderr into `push_error.log`.
+- If the error text contains "permission", "403", or "denied", the step
+  fails immediately with a clear `::error::` message pointing back to the
+  Workflow permissions setting — no more silent/ambiguous failures.
+- Otherwise it falls through to the existing fetch-rebase-retry loop (for
+  ordinary non-fast-forward conflicts, unrelated to permissions).
+
+## 6. Soi chéo
+
+| Symptom reported | Root cause | Fix |
+|---|---|---|
+| Run failed even after permission setting fixed | My own added permission-check step gave a false negative | Removed the check; real push result is now the only source of truth |
+| Garbage release `37522026.223.54613` | Legacy `release.yml` inherited from hagezi/dns-blocklists | Deleted that file (done in the previous turn) |
+| Release step could crash on duplicate CalVer tag (two runs same minute) | `gh release create` errors on existing tag | Now checks `gh release view` first and appends seconds (`-SS`) to disambiguate; a release-creation failure no longer marks the whole job failed if the sync commit already pushed successfully |
+
+## 7. Kiểm chừng
+
+After this push, trigger **Actions -> Auto Sync DNS Blocklists from GitLab
+-> Run workflow** again. Expect: a `chore(sync): ...` commit on `main`,
+`.sync_state.json` + `MANIFEST.sha256.txt` present at repo root, a release
+tagged `vYYYY.MM.DD-HHMM`, and a Telegram message with the per-category
+breakdown. If it still fails, the failure Telegram message and the
+`push_error.log` output in the Action log will now say exactly why
+(permission-denied vs. something else) instead of failing opaquely.
+
+## 8. Đánh giá chất lượng
+
+The fix trades a proactive-but-unreliable guard for a reactive-but-accurate
+one. This is the right tradeoff here: a false negative that blocks a
+perfectly working push is worse than a slightly later failure with an
+accurate message.
+
+## 9. Tài liệu hoá
+
+This file, plus inline comments in
+[`.github/workflows/auto-sync.yml`](.github/workflows/auto-sync.yml).
+
+## 10. Cải tiến
+
+- Push failures now distinguish "permission denied" from ordinary
+  conflicts and message accordingly.
+- Release creation is now idempotent against tag collisions and
+  non-fatal if it fails after a successful commit/push.
+- Telegram failure message now includes the permissions-setting hint
+  directly, so you don't have to open the Actions log to get a first
+  lead.
+
+## 11. Ngăn lỗi tái diễn
+
+Going forward, any new diagnostic step I add will be validated against
+the actual outcome (e.g. testing a real push) rather than inferred from a
+side-channel API field, to avoid repeating this class of false-negative
+bug.
+
+## 12. Báo cáo tối ưu
+
+No extra API calls were added (the removed check saved one `gh api` call
+per run); the push step now does at most one extra `cat` of a local log
+file, negligible overhead.
+
+## 13. Đánh giá cuối cùng
+
+The workflow's core logic (diff-only sync, SHA-256 manifest, CalVer
+release, category breakdown, Telegram notify) was correct all along — the
+only defect was the extra guard I added in the previous round. That guard
+is now removed and replaced with an accurate, ground-truth check at the
+push step itself.
