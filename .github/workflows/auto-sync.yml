@@ -1,0 +1,120 @@
+name: Auto Sync DNS Blocklists from GitLab
+
+on:
+  schedule:
+    - cron: '0 18 * * *'   # 18:00 UTC daily = 01:00 Asia/Singapore
+  workflow_dispatch: {}
+
+concurrency:
+  group: dns-blocklists-auto-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Sync blocklists from GitLab mirror & fix links (changed files only)
+        id: sync
+        run: python scripts/auto_sync.py
+
+      - name: Compute version tag (CalVer)
+        id: version
+        run: |
+          TAG="v$(date -u +%Y.%m.%d)-$(date -u +%H%M)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Stage changes
+        id: git_diff
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push (with rebase-retry on conflict)
+        if: steps.git_diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(sync): update blocklists ${{ steps.version.outputs.tag }} (${{ steps.sync.outputs.changed_count }} files)"
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $i), fetching + rebasing onto latest main..."
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "Rebase failed, giving up."
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+
+      - name: Create GitHub Release
+        if: steps.git_diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUMMARY_FILE="${{ steps.sync.outputs.summary_path }}"
+          NOTES="Auto-synced from hagezi/mirror (GitLab) on $(date -u +'%Y-%m-%d %H:%M UTC')."
+          NOTES="$NOTES
+
+Files changed: ${{ steps.sync.outputs.changed_count }}
+Commit: ${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD)"
+          if [ -f "$SUMMARY_FILE" ]; then
+            NOTES="$NOTES
+
+Changed files:
+$(cat "$SUMMARY_FILE")"
+          fi
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "Blocklists sync ${{ steps.version.outputs.tag }}" \
+            --notes "$NOTES" \
+            --target main
+
+      - name: Notify Telegram on success
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ steps.git_diff.outputs.changed }}" = "true" ]; then
+            STATUS="Updated ${{ steps.sync.outputs.changed_count }} file(s), released as ${{ steps.version.outputs.tag }}."
+          else
+            STATUS="No changes upstream, nothing to update."
+          fi
+          MESSAGE="dns-blocklists auto-sync succeeded on $(date -u +'%Y-%m-%d %H:%M UTC').%0A${STATUS}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="${MESSAGE}"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MESSAGE="dns-blocklists auto-sync FAILED on $(date -u +'%Y-%m-%d %H:%M UTC'). Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="${MESSAGE}"
